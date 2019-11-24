@@ -1,0 +1,92 @@
+#!/bin/bash
+#PBS -P zc9
+#PBS -q normal
+#PBS -l ncpus=1
+#PBS -l mem=4G
+#PBS -l walltime=20:00:00
+#PBS -l wd
+#PBS -l other=gdata3
+
+set -euo pipefail
+
+module load java/jdk1.8.0_60
+module load R/3.4.3
+module load python/2.7.5
+export PATH=/g/data3/zc9/users/emr913/immune_typing/OptiType/bedtools2/bin:$PATH # bedtools v2.25.0
+
+queue_file="${OUTFILE}.queued"
+lock_file="${OUTFILE}.lock"
+done_file="${OUTFILE}.done"
+
+touch "${lock_file}"
+rm -f "${queue_file}"
+
+temp="${PBS_JOBFS}"
+
+gene_cds_exons="programs2/UCSC_GRCh37_GenesAndGenePredictions_CDSexons_RefSeq_20170928.bed"
+
+vcf_file="${OUTFILE}".temp.vcf.gz
+hetdp_file="${OUTFILE}".temp_soma-cnv.hetdp.xz
+rds_file="${OUTFILE}".soma-cnv.rds
+outfile1="${OUTFILE}".nb2_counts.tsv
+outfile2="${OUTFILE}".nb2_position.tsv
+outfile3="${OUTFILE}".nb2_non_zero_events.bed
+outfile4="${OUTFILE}".nb2_non_zero_events_genes_hit.bed
+outfile5="${OUTFILE}".nb2_depth_and_vaf_and_position_tallies.tsv
+
+#rm -f "${vcf_file}"
+#rm -f "${hetdp_file}"
+#rm -f "${rds_file}"
+#rm -f "${outfile1}"
+#rm -f "${outfile2}"
+#rm -f "${outfile3}"
+#rm -f "${outfile4}"
+#rm -f "${outfile5}"
+
+echo 'Run GATK HC'
+# -ip 100 instructs HC to consider a region of 100 bp around each locus, to enable 
+# local haplotype reassembly.  Note that because of this, some additional variant 
+# loci may be reported (not just those in the interval_list), but these will be 
+# removed at the later R stage.
+java -Xmx2G -Djava.io.tmpdir="${temp}" -jar bin/GenomeAnalysisTK.jar -T HaplotypeCaller \
+  -R "${REFERENCE}" \
+  -L "${INTERVALS}" -ip 100 \
+  -I "${INFILE}" -o "${vcf_file}"
+
+echo 'Post-process the GATK VCF: extract het SNP loci and report depths.'
+gunzip -cd "${vcf_file}" | awk -f util/filter_hc_vcf.awk | xz -c > "${hetdp_file}"
+
+#rm -f "${vcf_file}"
+#rm -f "${vcf_file}".tbi
+
+echo 'Per-sample: Fit soma-cnv model and identify aneuploid regions'
+Rscript soma-cnv.R \
+  data/truseq_nano_hiseqX_hs37d5x.affinity.tsv \
+  data/truseq_nano_hiseqX_hs37d5x.gc.tsv \
+  "${hetdp_file}" "${rds_file}" 
+#  --diag="${OUTFILE}"
+
+#rm -f "${hetdp_file}"
+
+echo "Rscript calculate_counts_from_depth_and_vaf_for_one_sample.R" "${rds_file}" "${outfile1}"
+Rscript programs2/calculate_counts_from_depth_and_vaf_for_one_sample.R "${rds_file}" "${outfile1}"
+
+echo "Rscript calculate_counts_from_depth_and_vaf_and_position_get_position_for_one_sample.R" "${rds_file}" "${outfile2}"
+Rscript programs2/calculate_counts_from_depth_and_vaf_and_position_get_position_for_one_sample.R "${rds_file}" "${outfile2}"
+
+awk -F "\t" 'BEGIN {OFS="\t"} {print $1, $5-2, $6+1, $3, $4, "fit", $7, $8 }' "${outfile2}" | grep -vP 'fit\t1\t1' | cut -d$'\t' -f1-5 | grep -v '^chrom' > "${outfile3}"
+
+echo 'bedtools intersect'
+bedtools intersect -a "${outfile3}" -b "${gene_cds_exons}" -wo | awk -F "\t" 'BEGIN {OFS="\t"} {print $1, $2, $3, $4, $5, $9 }' | sort -k1,1n -k2,2n | uniq > "${outfile4}"
+
+echo "python calculate_counts_from_depth_and_vaf_and_position_for_one_sample_2018mar.py -i" "${outfile1}" "-i2" "${outfile2}" "-s" "-i3" "${outfile4}" "${SAMPLEID}" "-o" "${outfile5}"
+python programs2/calculate_counts_from_depth_and_vaf_and_position_for_one_sample_2018mar.py -i "${outfile1}" -i2 "${outfile2}" -i3 "${outfile4}" -s "${SAMPLEID}" -o "${outfile5}"
+
+#rm -rf "${outfile1}"
+#rm -rf "${outfile2}"
+#rm -rf "${outfile3}"
+#rm -rf "${outfile4}"
+
+touch "${done_file}"
+rm -f "${lock_file}"
+
